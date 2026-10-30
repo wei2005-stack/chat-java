@@ -1,0 +1,258 @@
+import { type Ref, ref } from 'vue'
+import { v7 as uuidv7 } from 'uuid'
+import { useStreamHandling } from './useStreamHandling'
+import { useErrorHandling } from './useErrorHandling'
+import { useValidation } from './useValidation'
+import { useChat } from '@/views/chat/hooks/useChat'
+import { nowISO } from '@/utils/date'
+import type { AnswerStreamEvent } from '@/utils/sse'
+import { useMessageStore, useSessionStore } from '@/store'
+
+interface ChatMessage {
+  uuid: string
+  dateTime: string
+  text: string
+  inversion: boolean
+  error: boolean
+  loading?: boolean
+  artifacts?: any[]
+}
+
+export function useConversationFlow(
+  sessionUuidRef: Ref<string>,
+  scrollToBottom: () => Promise<void>,
+  smoothScrollToBottomIfAtBottom: () => Promise<void>,
+) {
+  const loading = ref<boolean>(false)
+  const abortController = ref<AbortController | null>(null)
+  const { addChat, updateChat, updateChatPartial, getChatByUuidAndIndex } = useChat()
+  const { streamChatResponse, processAnswerEvent } = useStreamHandling()
+  const { handleApiError, showErrorNotification } = useErrorHandling()
+  const { validateChatMessage } = useValidation()
+  const sessionStore = useSessionStore()
+  const messageStore = useMessageStore()
+
+  async function refreshSessionTitle(sessionUuid: string): Promise<void> {
+    const session = sessionStore.getChatSessionByUuid(sessionUuid)
+    const workspaceUuid = session?.workspaceUuid
+
+    if (!workspaceUuid)
+      return
+
+    const maxAttempts = 8
+    const retryDelayMs = 2000
+    let lastSeenTitle = session.title
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0)
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs))
+
+      await sessionStore.syncWorkspaceSessions(workspaceUuid)
+
+      const refreshedSession = sessionStore.getChatSessionByUuid(sessionUuid)
+      if (!refreshedSession?.title)
+        return
+
+      if (refreshedSession.title !== lastSeenTitle)
+        return
+
+      lastSeenTitle = refreshedSession.title
+    }
+  }
+
+  function validateConversationInput(message: string): boolean {
+    if (loading.value) {
+      showErrorNotification('Please wait for the current message to complete')
+      return false
+    }
+
+    if (!sessionUuidRef.value) {
+      showErrorNotification('No active session selected')
+      return false
+    }
+
+    // Validate message content
+    const messageValidation = validateChatMessage(message)
+    if (!messageValidation.isValid) {
+      showErrorNotification(messageValidation.errors[0])
+      return false
+    }
+
+    return true
+  }
+
+  async function addUserMessage(chatUuid: string, message: string): Promise<void> {
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid)
+      return
+
+    const chatMessage: ChatMessage = {
+      uuid: chatUuid,
+      dateTime: nowISO(),
+      text: message,
+      inversion: true,
+      error: false,
+    }
+
+    addChat(sessionUuid, chatMessage)
+    await scrollToBottom()
+  }
+
+  async function initializeChatResponse(dataSources: any[]): Promise<number> {
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid)
+      return dataSources.length - 1
+
+    const responseIndex = dataSources.length
+    addChat(sessionUuid, {
+      uuid: '',
+      dateTime: nowISO(),
+      text: '',
+      loading: true,
+      inversion: false,
+      error: false,
+    })
+    await smoothScrollToBottomIfAtBottom()
+    return responseIndex
+  }
+
+  function handleStreamingError(error: any, responseIndex: number, dataSources: any[]): void {
+    handleApiError(error, 'conversation-stream')
+
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid)
+      return
+    const lastMessage = getChatByUuidAndIndex(sessionUuid, responseIndex) || dataSources[responseIndex]
+
+    if (lastMessage) {
+      const errorMessage: ChatMessage = {
+        uuid: lastMessage.uuid || uuidv7(),
+        dateTime: nowISO(),
+        text: 'Failed to get response. Please try again.',
+        inversion: false,
+        error: true,
+        loading: false,
+      }
+
+      updateChat(sessionUuid, responseIndex, errorMessage)
+    }
+  }
+
+  function stopStream(): void {
+    if (abortController.value) {
+      abortController.value.abort()
+      abortController.value = null
+    }
+    loading.value = false
+  }
+
+  async function startStream(
+    message: string,
+    dataSources: any[],
+    chatUuid: string,
+  ): Promise<void> {
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid) {
+      loading.value = false
+      abortController.value = null
+      return
+    }
+
+    loading.value = true
+    let streamCompleted = false
+    abortController.value = new AbortController()
+    const responseIndex = await initializeChatResponse(dataSources)
+    const handleAnswerEvent = async (event: AnswerStreamEvent, index: number) => {
+      processAnswerEvent(event, index, sessionUuid)
+      await smoothScrollToBottomIfAtBottom()
+    }
+
+    try {
+      await streamChatResponse(
+        sessionUuid,
+        chatUuid,
+        message,
+        responseIndex,
+        handleAnswerEvent,
+        abortController.value.signal,
+      )
+      streamCompleted = true
+    }
+    catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        // Stream was cancelled, no need to show error
+        return
+      }
+
+      // Reconcile once with the same request UUID. The server will either
+      // replay a durably completed answer or safely reclaim a failed request.
+      if (error instanceof Error && error.message.includes('ended before it was saved')) {
+        updateChat(sessionUuid, responseIndex, {
+          uuid: '',
+          dateTime: nowISO(),
+          text: '',
+          loading: true,
+          inversion: false,
+          error: false,
+        })
+        await new Promise(resolve => setTimeout(resolve, 500))
+
+        try {
+          await streamChatResponse(
+            sessionUuid,
+            chatUuid,
+            message,
+            responseIndex,
+            handleAnswerEvent,
+            abortController.value.signal,
+          )
+          streamCompleted = true
+          return
+        }
+        catch (reconciliationError) {
+          handleStreamingError(reconciliationError, responseIndex, dataSources)
+          return
+        }
+      }
+
+      handleStreamingError(error, responseIndex, dataSources)
+    }
+    finally {
+      if (streamCompleted) {
+        try {
+          // Streaming extraction is provisional. Reload the persisted message so
+          // server-generated artifact IDs and content are authoritative.
+          await messageStore.syncChatMessages(sessionUuid)
+        }
+        catch (error) {
+          console.error('Failed to reconcile persisted artifacts:', error)
+        }
+      }
+      loading.value = false
+      abortController.value = null
+
+      void refreshSessionTitle(sessionUuid).catch((error) => {
+        console.error('Failed to refresh session title:', error)
+      })
+
+      // For sessions in exploreMode, set suggested questions loading state
+      const session = sessionStore.getChatSessionByUuid(sessionUuid)
+      const responseMessage = getChatByUuidAndIndex(sessionUuid, responseIndex) || dataSources[responseIndex]
+      if (session?.exploreMode && responseMessage && !responseMessage.inversion) {
+        updateChatPartial(sessionUuid, responseIndex, {
+          suggestedQuestionsLoading: true,
+        })
+      }
+    }
+  }
+
+  return {
+    loading,
+    validateConversationInput,
+    addUserMessage,
+    initializeChatResponse,
+    handleStreamingError,
+    startStream,
+    stopStream,
+  }
+}

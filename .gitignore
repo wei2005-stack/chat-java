@@ -1,0 +1,12 @@
+.DS_Store
+.env*
+env.sh
+env.ps
+data
+.python-version
+.aider*
+.tools/
+.screenshots/
+*.log
+server-java/target/
+

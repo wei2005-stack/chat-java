@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "web"
+		},
+		{
+			"path": "api"
+		},
+		{
+			"path": "e2e"
+		},
+		{
+			"path": "docs"
+		}
+	],
+	"settings": {},
+	"trae": {
+		"workspaceId": "565389f06c7b03f608c9774c132ccef0"
+	}
+}

@@ -1,0 +1,412 @@
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+import {
+  NButton,
+  NCard,
+  NEmpty,
+  NGrid,
+  NGridItem,
+  NInput,
+  NModal,
+  NSwitch,
+  useDialog,
+  useMessage,
+} from 'naive-ui'
+import WorkspaceCard from './WorkspaceCard.vue'
+import WorkspaceModal from './WorkspaceModal.vue'
+import { SvgIcon } from '@/components/common'
+import { useWorkspaceStore } from '@/store/modules/workspace'
+import { t } from '@/locales'
+
+interface Props {
+  visible: boolean
+}
+
+interface Emits {
+  (e: 'update:visible', value: boolean): void
+}
+
+const props = defineProps<Props>()
+const emit = defineEmits<Emits>()
+
+const workspaceStore = useWorkspaceStore()
+const message = useMessage()
+const dialog = useDialog()
+
+const searchQuery = ref('')
+const showCreateModal = ref(false)
+const showEditModal = ref(false)
+const editingWorkspace = ref<Chat.Workspace | null>(null)
+const dragMode = ref(false)
+const draggedWorkspace = ref<Chat.Workspace | null>(null)
+const dragOverIndex = ref<number | null>(null)
+
+const isVisible = computed({
+  get: () => props.visible,
+  set: value => emit('update:visible', value),
+})
+
+const workspaces = computed(() => workspaceStore.workspaces)
+
+const filteredWorkspaces = computed(() => {
+  if (!searchQuery.value.trim())
+    return workspaces.value
+
+  const query = searchQuery.value.toLowerCase()
+  return workspaces.value.filter(workspace =>
+    workspace.name.toLowerCase().includes(query)
+    || workspace.description?.toLowerCase().includes(query),
+  )
+})
+
+function handleClose() {
+  isVisible.value = false
+  searchQuery.value = ''
+}
+
+function handleCreateWorkspace() {
+  showCreateModal.value = true
+}
+
+function handleEditWorkspace(workspace: Chat.Workspace) {
+  editingWorkspace.value = workspace
+  showEditModal.value = true
+}
+
+function handleDeleteWorkspace(workspace: Chat.Workspace) {
+  if (workspace.isDefault) {
+    message.warning(t('workspace.cannotDeleteDefault'))
+    return
+  }
+
+  dialog.warning({
+    title: t('common.warning'),
+    content: t('workspace.deleteConfirmNamed', { name: workspace.name }),
+    positiveText: t('common.confirm'),
+    negativeText: t('common.cancel'),
+    async onPositiveClick() {
+      try {
+        await workspaceStore.deleteWorkspace(workspace.uuid)
+        message.success(t('workspace.deleted'))
+      }
+      catch (error) {
+        console.error('Failed to delete workspace:', error)
+        message.error(t('workspace.deleteError'))
+      }
+    },
+  })
+}
+
+function duplicateName(workspace: Chat.Workspace): string {
+  const baseName = t('workspace.copyName', { name: workspace.name })
+  const firstCandidate = baseName.slice(0, 50)
+  const existingNames = new Set(workspaces.value.map(item => item.name.toLocaleLowerCase()))
+  if (!existingNames.has(firstCandidate.toLocaleLowerCase()))
+    return firstCandidate
+
+  for (let copyNumber = 2; ; copyNumber++) {
+    const suffix = ` ${copyNumber}`
+    const candidate = `${baseName.slice(0, 50 - suffix.length)}${suffix}`
+    if (!existingNames.has(candidate.toLocaleLowerCase()))
+      return candidate
+  }
+}
+
+async function handleDuplicateWorkspace(workspace: Chat.Workspace) {
+  try {
+    const duplicate = await workspaceStore.createWorkspace(
+      duplicateName(workspace),
+      workspace.description || '',
+      workspace.color,
+      workspace.icon,
+    )
+    message.success(t('workspace.duplicateSuccess', { name: duplicate.name }))
+  }
+  catch (error) {
+    console.error('Failed to duplicate workspace:', error)
+    message.error(t('workspace.duplicateError'))
+  }
+}
+
+async function handleSetDefaultWorkspace(workspace: Chat.Workspace) {
+  if (workspace.isDefault)
+    return
+
+  try {
+    await workspaceStore.setDefaultWorkspace(workspace.uuid)
+    message.success(t('workspace.defaultSuccess', { name: workspace.name }))
+  }
+  catch (error) {
+    console.error('Failed to set default workspace:', error)
+    message.error(t('workspace.defaultError'))
+  }
+}
+
+async function handleWorkspaceCreated(workspace: Chat.Workspace) {
+  await workspaceStore.setActiveWorkspace(workspace.uuid)
+  message.success(`Created and switched to ${workspace.name}`)
+  showCreateModal.value = false
+}
+
+function handleWorkspaceUpdated(workspace: Chat.Workspace) {
+  message.success(`Updated workspace: ${workspace.name}`)
+  showEditModal.value = false
+  editingWorkspace.value = null
+}
+
+// Drag and drop handlers
+function handleDragStart(event: DragEvent, workspace: Chat.Workspace) {
+  if (!dragMode.value)
+    return
+
+  draggedWorkspace.value = workspace
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', workspace.uuid)
+  }
+}
+
+function handleDragOver(event: DragEvent, index: number) {
+  if (!dragMode.value)
+    return
+
+  event.preventDefault()
+  dragOverIndex.value = index
+  if (event.dataTransfer)
+    event.dataTransfer.dropEffect = 'move'
+}
+
+function handleDragLeave() {
+  if (!dragMode.value)
+    return
+  dragOverIndex.value = null
+}
+
+function handleDrop(event: DragEvent, targetIndex: number) {
+  if (!dragMode.value || !draggedWorkspace.value)
+    return
+
+  event.preventDefault()
+
+  const draggedIndex = filteredWorkspaces.value.findIndex(w => w.uuid === draggedWorkspace.value!.uuid)
+
+  if (draggedIndex !== -1 && draggedIndex !== targetIndex) {
+    // Reorder workspaces
+    reorderWorkspaces(draggedIndex, targetIndex)
+  }
+
+  // Reset drag state
+  draggedWorkspace.value = null
+  dragOverIndex.value = null
+}
+
+function handleDragEnd() {
+  draggedWorkspace.value = null
+  dragOverIndex.value = null
+}
+
+async function reorderWorkspaces(fromIndex: number, toIndex: number) {
+  try {
+    console.log(`🔄 Reordering workspace from ${fromIndex} to ${toIndex}`)
+
+    const draggedWorkspace = filteredWorkspaces.value[fromIndex]
+    const targetWorkspace = filteredWorkspaces.value[toIndex]
+    if (!draggedWorkspace || !targetWorkspace) {
+      console.warn('Invalid drag target for workspace reorder')
+      return
+    }
+
+    // Reorder against the full workspace list so filtered views don't drop hidden workspaces.
+    const reorderedWorkspaces = [...workspaces.value]
+    const fromFullIndex = reorderedWorkspaces.findIndex(w => w.uuid === draggedWorkspace.uuid)
+    const toFullIndex = reorderedWorkspaces.findIndex(w => w.uuid === targetWorkspace.uuid)
+    if (fromFullIndex === -1 || toFullIndex === -1) {
+      console.warn('Failed to map filtered reorder to full workspace list')
+      return
+    }
+
+    const [draggedItem] = reorderedWorkspaces.splice(fromFullIndex, 1)
+    reorderedWorkspaces.splice(toFullIndex, 0, draggedItem)
+
+    console.log('📋 New order:', reorderedWorkspaces.map((w, i) => `${i}: ${w.name}`))
+
+    await workspaceStore.updateWorkspaceOrder(reorderedWorkspaces.map(w => w.uuid))
+
+    message.success(t('workspace.reorderSuccess'))
+    console.log('✅ Workspace reordering completed')
+  }
+  catch (error) {
+    console.error('❌ Failed to reorder workspaces:', error)
+    message.error(t('workspace.reorderError'))
+  }
+}
+</script>
+
+<template>
+  <NModal v-model:show="isVisible" :mask-closable="false" class="workspace-management-modal">
+    <NCard
+      :title="t('workspace.manage')"
+      class="w-full max-w-5xl"
+      :bordered="false"
+      size="small"
+      role="dialog"
+      aria-modal="true"
+    >
+      <template #header-extra>
+        <NButton quaternary circle @click="handleClose">
+          <template #icon>
+            <SvgIcon icon="material-symbols:close" />
+          </template>
+        </NButton>
+      </template>
+
+      <!-- Header Actions -->
+      <div class="mb-6 space-y-4">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-4">
+            <NInput
+              v-model:value="searchQuery"
+              :placeholder="t('workspace.searchPlaceholder')"
+              clearable
+              class="w-64"
+            >
+              <template #prefix>
+                <SvgIcon icon="material-symbols:search" />
+              </template>
+            </NInput>
+
+            <div class="flex items-center gap-2">
+              <SvgIcon icon="material-symbols:drag-indicator" class="text-sm" />
+              <span class="text-sm">{{ t('workspace.reorderMode') }}</span>
+              <NSwitch
+                v-model:value="dragMode"
+                size="small"
+                :round="false"
+              />
+            </div>
+          </div>
+
+          <NButton type="primary" @click="handleCreateWorkspace">
+            <template #icon>
+              <SvgIcon icon="material-symbols:add" />
+            </template>
+            {{ t('workspace.create') }}
+          </NButton>
+        </div>
+
+        <!-- Summary Info -->
+        <div class="text-sm text-gray-600 dark:text-gray-400">
+          {{ t('workspace.totalCount', { count: filteredWorkspaces.length }) }}
+          <span v-if="searchQuery.trim()" class="ml-2">
+            ({{ t('workspace.filteredResults', { total: workspaces.length }) }})
+          </span>
+        </div>
+      </div>
+
+      <!-- Workspace Grid -->
+      <div class="workspace-grid">
+        <NEmpty v-if="filteredWorkspaces.length === 0" :description="t('workspace.noWorkspaces')">
+          <template #icon>
+            <SvgIcon icon="material-symbols:folder-off" class="text-4xl" />
+          </template>
+          <template #extra>
+            <NButton type="primary" @click="handleCreateWorkspace">
+              {{ t('workspace.createFirst') }}
+            </NButton>
+          </template>
+        </NEmpty>
+
+        <NGrid v-else :cols="3" :x-gap="16" :y-gap="16" responsive="screen">
+          <NGridItem
+            v-for="(workspace, index) in filteredWorkspaces"
+            :key="workspace.uuid"
+            class="workspace-grid-item"
+            :class="{
+              'workspace-grid-item--drag-mode': dragMode,
+              'workspace-grid-item--drag-over': dragOverIndex === index,
+              'workspace-grid-item--dragging': draggedWorkspace?.uuid === workspace.uuid,
+            }"
+            :draggable="dragMode"
+            @dragstart="handleDragStart($event, workspace, index)"
+            @dragover="handleDragOver($event, index)"
+            @dragleave="handleDragLeave"
+            @drop="handleDrop($event, index)"
+            @dragend="handleDragEnd"
+          >
+            <WorkspaceCard
+              :workspace="workspace"
+              :drag-mode="dragMode"
+              @edit="handleEditWorkspace"
+              @delete="handleDeleteWorkspace"
+              @duplicate="handleDuplicateWorkspace"
+              @set-default="handleSetDefaultWorkspace"
+            />
+          </NGridItem>
+        </NGrid>
+      </div>
+
+      <!-- Create Workspace Modal -->
+      <WorkspaceModal
+        v-model:visible="showCreateModal"
+        mode="create"
+        @workspace-created="handleWorkspaceCreated"
+      />
+
+      <!-- Edit Workspace Modal -->
+      <WorkspaceModal
+        v-model:visible="showEditModal"
+        mode="edit"
+        :workspace="editingWorkspace"
+        @workspace-updated="handleWorkspaceUpdated"
+      />
+    </NCard>
+  </NModal>
+</template>
+
+<style scoped>
+.workspace-management-modal {
+  --n-bezier: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.workspace-grid {
+  min-height: 400px;
+}
+
+/* Drag and drop styles */
+.workspace-grid-item {
+  transition: all 0.2s ease;
+}
+
+.workspace-grid-item--drag-mode {
+  cursor: grab;
+}
+
+.workspace-grid-item--drag-mode:active {
+  cursor: grabbing;
+}
+
+.workspace-grid-item--dragging {
+  opacity: 0.5;
+  transform: scale(0.95);
+}
+
+.workspace-grid-item--drag-over {
+  transform: scale(1.02);
+  background: rgba(24, 160, 88, 0.1);
+  border-radius: 8px;
+  border: 2px dashed #18a058;
+}
+
+/* Responsive grid adjustments */
+@media (max-width: 1024px) {
+  .workspace-grid :deep(.n-grid) {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+}
+
+@media (max-width: 640px) {
+  .workspace-grid :deep(.n-grid) {
+    grid-template-columns: 1fr !important;
+  }
+}
+</style>

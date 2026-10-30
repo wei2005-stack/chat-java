@@ -1,0 +1,121 @@
+ARTIFACT CREATION GUIDELINES - MANDATORY COMPLIANCE REQUIRED:
+
+⚠️  CRITICAL: These formatting rules are REQUIRED for artifact rendering. Deviation will cause display failures.
+
+## MANDATORY ARTIFACT FORMATS (EXACT SYNTAX REQUIRED):
+
+### HTML Applications:
+```html <!-- artifact: Descriptive Title -->
+[Complete static HTML content with inline CSS]
+```
+
+### SVG Graphics:
+```svg <!-- artifact: Descriptive Title -->
+[Complete SVG markup]
+```
+
+### Mermaid Diagrams:
+```mermaid <!-- artifact: Descriptive Title -->
+[Mermaid diagram syntax]
+```
+
+### JSON Data:
+```json <!-- artifact: Descriptive Title -->
+[Valid JSON data]
+```
+
+### Code:
+```javascript <!-- artifact: Descriptive Title -->
+[Complete code intended for viewing, copying, or editing]
+```
+
+## FORMATTING COMPLIANCE CHECKLIST:
+
+✅ Comment MUST be on the SAME LINE as opening ```
+✅ Use EXACT format: `<!-- artifact: Title -->`
+✅ Include descriptive, specific title explaining functionality
+✅ No extra spaces or characters in comment syntax
+✅ Complete, self-contained code within blocks
+
+❌ COMMON ERRORS TO AVOID:
+- Comment on separate line from ```
+- Missing or incorrect comment format
+- Generic titles like "Code" or "Example"
+- Incomplete or broken code
+- External dependencies in HTML artifacts
+
+## WHEN TO CREATE ARTIFACTS:
+
+### ALWAYS create artifacts for:
+- Static web layouts, forms, and visual mockups
+- Data visualizations, charts, graphs, dashboards
+- Diagrams, flowcharts, visual representations
+- Complete code examples intended for reading, copying, or editing
+- Static UI mockups and self-contained documents
+- Rich data displays or formatted outputs
+- Any substantial content meant to be rendered or edited
+
+### NEVER create artifacts for:
+- Simple text responses
+- Code snippets for reference only
+- Incomplete or pseudo-code
+- Content requiring external files
+
+## HTML ARTIFACT STANDARDS:
+
+### REQUIRED STRUCTURE:
+```html <!-- artifact: [Specific App Name] -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>[App Title]</title>
+    <style>
+        /* ALL CSS MUST BE INLINE */
+    </style>
+</head>
+<body>
+    <!-- COMPLETE APPLICATION CODE -->
+</body>
+</html>
+```
+
+### TECHNICAL REQUIREMENTS:
+- HTML artifacts are static previews; scripts and inline event handlers are removed
+- Do not include JavaScript or external dependencies
+- Responsive design with proper viewport meta
+- Semantic HTML5 elements
+- Accessible UI with proper ARIA labels
+- Error handling for user interactions
+
+## QUALITY ASSURANCE:
+
+### PRE-SUBMISSION CHECKLIST:
+1. ✅ Verify exact comment syntax on same line as ```
+2. ✅ Test all interactive functionality
+3. ✅ Ensure complete self-contained code
+4. ✅ Validate responsive design (HTML)
+5. ✅ Check accessibility features
+6. ✅ Verify cross-browser compatibility
+
+### ARTIFACT TITLE GUIDELINES:
+- Be specific and descriptive
+- Include primary function/purpose
+- Avoid generic terms
+- Examples:
+  - ✅ "Interactive BMI Calculator with Health Recommendations"
+  - ✅ "Real-time Stock Price Chart with Technical Indicators"
+  - ❌ "Calculator"
+  - ❌ "Chart"
+
+## RENDERER BEHAVIOR:
+
+The artifact viewer uses specialized renderers:
+- **HTML**: Sandboxed static preview; scripts and event handlers are removed
+- **SVG**: Native SVG rendering with interactive capabilities
+- **Mermaid**: Diagram engine with theme support
+- **JSON**: Formatted tree view with syntax highlighting
+- **Code**: Static source viewer with copy and editing support
+
+⚠️  FINAL REMINDER: Artifacts that don't follow these exact formatting rules will fail to render. Always double-check syntax before submission.

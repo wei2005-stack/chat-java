@@ -1,0 +1,450 @@
+package svc
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"log/slog"
+	"strings"
+	"time"
+
+	_ "embed"
+	"github.com/rotisserie/eris"
+	"github.com/samber/lo"
+	"github.com/swuecho/chat_backend/domain"
+	models "github.com/swuecho/chat_backend/models"
+	"github.com/swuecho/chat_backend/pkg/util"
+	"github.com/swuecho/chat_backend/provider"
+	"github.com/swuecho/chat_backend/sqlc_queries"
+)
+
+type ChatService struct {
+	q            *sqlc_queries.Queries
+	modelCatalog *llmModelCatalog
+	newID        func() string
+	openAIKey    string
+	openAIProxy  string
+	suggestions  SuggestionGenerator
+	audit        ChatAuditLogger
+	knowledge    *KnowledgeService
+}
+
+//go:embed artifact_instruction.txt
+var artifactInstructionText string
+
+// NewChatService creates a new ChatService with database queries and OpenAI configuration.
+func NewChatService(q *sqlc_queries.Queries, openAIKey, openAIProxy string) *ChatService {
+	return &ChatService{q: q, modelCatalog: newLLMModelCatalog(q), newID: util.NewUUID, openAIKey: openAIKey, openAIProxy: openAIProxy,
+		suggestions: NewLLMSuggestionGenerator(q, openAIKey, openAIProxy), audit: NewSQLChatAuditLogger(q), knowledge: NewKnowledgeService(q)}
+}
+
+func (s *ChatService) SuggestionGenerator() SuggestionGenerator { return s.suggestions }
+func (s *ChatService) AuditLogger() ChatAuditLogger             { return s.audit }
+
+func (s *ChatService) ProviderModel(ctx context.Context, name string) (provider.ModelConfig, error) {
+	return s.modelCatalog.get(ctx, name)
+}
+
+func (s *ChatService) ProviderRequest(ctx context.Context, session ChatSession, messages []models.Message, chatUUID string, regenerate, stream bool) (provider.Request, error) {
+	model, err := s.ProviderModel(ctx, session.Model)
+	if err != nil {
+		return provider.Request{}, err
+	}
+	rows, err := s.q.ListChatFilesWithContentBySessionUUID(ctx, session.UUID)
+	if err != nil {
+		return provider.Request{}, err
+	}
+	files := make([]provider.File, 0, len(rows))
+	for _, row := range rows {
+		files = append(files, provider.File{Name: row.Name, Data: row.Data, MIMEType: row.MimeType})
+	}
+	return provider.Request{Session: providerSession(session), Model: model, Files: files,
+		Messages: s.augmentWithKnowledge(ctx, session, messages), ChatUUID: chatUUID, Regenerate: regenerate, Stream: stream, NewID: s.newID}, nil
+}
+
+// augmentWithKnowledge prepends a system message containing knowledge base
+// excerpts when the user has documents and the question matches them. Retrieval
+// failures must never block a normal chat request.
+func (s *ChatService) augmentWithKnowledge(ctx context.Context, session ChatSession, messages []models.Message) []models.Message {
+	if s.knowledge == nil {
+		return messages
+	}
+	query := lastUserQuestion(messages)
+	if query == "" {
+		return messages
+	}
+	block, ok, err := s.knowledge.BuildContext(ctx, session.UserID, query)
+	if err != nil {
+		slog.Warn("knowledge retrieval failed", "error", err, "sessionUUID", session.UUID)
+		return messages
+	}
+	if !ok {
+		return messages
+	}
+	augmented := make([]models.Message, 0, len(messages)+1)
+	augmented = append(augmented, models.Message{Role: "system", Content: block})
+	augmented = append(augmented, messages...)
+	return augmented
+}
+
+// lastUserQuestion returns the most recent non-assistant message, which is the
+// current question in both prompt-first and message-first session layouts.
+func lastUserQuestion(messages []models.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" && strings.TrimSpace(messages[i].Content) != "" {
+			return messages[i].Content
+		}
+	}
+	return ""
+}
+
+func (s *ChatService) MarkChatRequestFailed(ctx context.Context, requestUUID, sessionUUID string, userID int32, code string) error {
+	rows, err := s.q.MarkChatRequestFailed(ctx, sqlc_queries.MarkChatRequestFailedParams{
+		Uuid: requestUUID, ChatSessionUuid: sessionUUID, UserID: userID, ErrorCode: code,
+	})
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return transitionError(requestUUID, ChatRequestFailed)
+	}
+	return nil
+}
+
+func (s *ChatService) MarkChatRequestCanceled(ctx context.Context, requestUUID, sessionUUID string, userID int32, code string) error {
+	rows, err := s.q.MarkChatRequestCanceled(ctx, sqlc_queries.MarkChatRequestCanceledParams{Uuid: requestUUID, ChatSessionUuid: sessionUUID, UserID: userID, ErrorCode: code})
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return transitionError(requestUUID, ChatRequestCanceled)
+	}
+	return nil
+}
+
+func (s *ChatService) Claim(ctx context.Context, requestUUID, sessionUUID string, userID int32) error {
+	return s.ClaimChatRequest(ctx, requestUUID, sessionUUID, userID)
+}
+func (s *ChatService) State(ctx context.Context, requestUUID, sessionUUID string, userID int32) (ChatRequestState, error) {
+	return s.GetChatRequest(ctx, requestUUID, sessionUUID, userID)
+}
+func (s *ChatService) StartStreaming(ctx context.Context, requestUUID, sessionUUID string, userID int32) error {
+	return s.MarkChatRequestStreaming(ctx, requestUUID, sessionUUID, userID)
+}
+func (s *ChatService) Fail(ctx context.Context, requestUUID, sessionUUID string, userID int32, code string) error {
+	return s.MarkChatRequestFailed(ctx, requestUUID, sessionUUID, userID, code)
+}
+func (s *ChatService) Cancel(ctx context.Context, requestUUID, sessionUUID string, userID int32, code string) error {
+	return s.MarkChatRequestCanceled(ctx, requestUUID, sessionUUID, userID, code)
+}
+
+func (s *ChatService) ClaimChatRequest(ctx context.Context, requestUUID, sessionUUID string, userID int32) error {
+	_, err := s.q.ClaimChatRequest(ctx, sqlc_queries.ClaimChatRequestParams{
+		Uuid: requestUUID, ChatSessionUuid: sessionUUID, UserID: userID,
+	})
+	return err
+}
+
+type ChatRequestState struct {
+	UUID, SessionUUID, AssistantUUID, ErrorCode string
+	Status                                      ChatRequestStatus
+}
+
+func (s *ChatService) GetChatRequest(ctx context.Context, requestUUID, sessionUUID string, userID int32) (ChatRequestState, error) {
+	r, err := s.q.GetChatRequest(ctx, sqlc_queries.GetChatRequestParams{
+		Uuid: requestUUID, ChatSessionUuid: sessionUUID, UserID: userID,
+	})
+	return ChatRequestState{UUID: r.Uuid, SessionUUID: r.ChatSessionUuid, Status: ChatRequestStatus(r.Status),
+		AssistantUUID: r.AssistantUuid, ErrorCode: r.ErrorCode}, err
+}
+
+func (s *ChatService) GetChatMessageByUUID(ctx context.Context, uuid string, userID int32) (ChatMessage, error) {
+	m, err := s.q.GetChatMessageByUUID(ctx, sqlc_queries.GetChatMessageByUUIDParams{Uuid: uuid, UserID: userID})
+	return chatMessageFromRecord(m), err
+}
+
+func (s *ChatService) MarkChatRequestStreaming(ctx context.Context, requestUUID, sessionUUID string, userID int32) error {
+	rows, err := s.q.MarkChatRequestStreaming(ctx, sqlc_queries.MarkChatRequestStreamingParams{
+		Uuid: requestUUID, ChatSessionUuid: sessionUUID, UserID: userID,
+	})
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return transitionError(requestUUID, ChatRequestStreaming)
+	}
+	return nil
+}
+
+// loadArtifactInstruction loads the artifact instruction from file.
+// Returns the instruction content or an error if the file cannot be read.
+func LoadArtifactInstruction() (string, error) {
+	if artifactInstructionText == "" {
+		return "", eris.New("artifact instruction text is empty")
+	}
+	return artifactInstructionText, nil
+}
+
+func appendInstructionToSystemMessage(msgs []models.Message, instruction string) {
+	if instruction == "" || len(msgs) == 0 {
+		return
+	}
+
+	systemMsgFound := false
+	for i, msg := range msgs {
+		if msg.Role == "system" {
+			msgs[i].Content = msg.Content + "\n" + instruction
+			msgs[i].SetTokenCount(int32(len(msgs[i].Content) / tokenEstimateRatio))
+			systemMsgFound = true
+			break
+		}
+	}
+
+	if !systemMsgFound {
+		msgs[0].Content = msgs[0].Content + "\n" + instruction
+		msgs[0].SetTokenCount(int32(len(msgs[0].Content) / tokenEstimateRatio))
+	}
+}
+
+// getAskMessages retrieves and processes chat messages for LLM requests.
+// It combines prompts and messages, applies length limits, and adds artifact instructions (unless explore mode is enabled).
+// Parameters:
+//   - chatSession: The chat session containing configuration
+//   - chatUuid: UUID for message identification (used in regenerate mode)
+//   - regenerate: If true, excludes the target message from history
+//
+// Returns combined message array or error.
+func (s *ChatService) GetAskMessages(ctx context.Context, chatSession ChatSession, chatUuid string, regenerate bool) ([]models.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*requestTimeoutSeconds)
+	defer cancel()
+
+	chatSessionUuid := chatSession.UUID
+
+	lastN := chatSession.MaxLength
+	if chatSession.MaxLength == 0 {
+		lastN = defaultMaxLength
+	}
+
+	chat_prompts, err := s.q.GetChatPromptsBySessionUUID(ctx, chatSessionUuid)
+
+	if err != nil {
+		return nil, eris.Wrap(err, "fail to get prompt: ")
+	}
+
+	var chatMessages []sqlc_queries.ChatMessage
+	if regenerate {
+		chatMessages, err = s.q.GetLastNChatMessages(ctx,
+			sqlc_queries.GetLastNChatMessagesParams{
+				ChatSessionUuid: chatSessionUuid,
+				Uuid:            chatUuid,
+				Limit:           lastN,
+			})
+
+	} else {
+		chatMessages, err = s.q.GetLatestMessagesBySessionUUID(ctx,
+			sqlc_queries.GetLatestMessagesBySessionUUIDParams{ChatSessionUuid: chatSession.UUID, Limit: lastN})
+	}
+
+	if err != nil {
+		return nil, eris.Wrap(err, "fail to get messages: ")
+	}
+	chatPromptMsgs := lo.Map(chat_prompts, func(m sqlc_queries.ChatPrompt, _ int) models.Message {
+		msg := models.Message{Role: m.Role, Content: m.Content}
+		msg.SetTokenCount(int32(m.TokenCount))
+		return msg
+	})
+	chatMessageMsgs := lo.Map(chatMessages, func(m sqlc_queries.ChatMessage, _ int) models.Message {
+		msg := models.Message{Role: m.Role, Content: m.Content}
+		msg.SetTokenCount(int32(m.TokenCount))
+		return msg
+	})
+	msgs := append(chatPromptMsgs, chatMessageMsgs...)
+
+	// Add artifact instruction to system messages only if artifact mode is enabled
+	if chatSession.ArtifactEnabled {
+		artifactInstruction, err := LoadArtifactInstruction()
+		if err != nil {
+			slog.Warn("Failed to load artifact instruction", "error", err)
+			artifactInstruction = "" // Use empty string if file can't be loaded
+		}
+
+		appendInstructionToSystemMessage(msgs, artifactInstruction)
+	}
+
+	return msgs, nil
+}
+
+// CreateChatPromptSimple creates a new chat prompt for a session.
+// This is typically used to start a new conversation with a system message.
+func (s *ChatService) CreateChatPromptSimple(ctx context.Context, chatSessionUuid string, newQuestion string, userID int32) (ChatPrompt, error) {
+	tokenCount, err := provider.GetTokenCount(newQuestion)
+	if err != nil {
+		slog.Warn("Failed to get token count for prompt", "error", err)
+		tokenCount = len(newQuestion) / tokenEstimateRatio // Fallback estimate
+	}
+	chatPrompt, err := s.q.CreateChatPrompt(ctx,
+		sqlc_queries.CreateChatPromptParams{
+			Uuid:            s.newID(),
+			ChatSessionUuid: chatSessionUuid,
+			Role:            "system",
+			Content:         newQuestion,
+			UserID:          userID,
+			CreatedBy:       userID,
+			UpdatedBy:       userID,
+			TokenCount:      int32(tokenCount),
+		})
+	return chatPromptFromRecord(chatPrompt), err
+}
+
+// CreateChatMessageSimple creates a new chat message with optional summarization and artifact extraction.
+// Handles token counting, content summarization for long messages, and artifact parsing.
+// Parameters:
+//   - ctx: Request context for cancellation
+//   - sessionUuid, uuid: Message and session identifiers
+//   - role: Message role (user/assistant/system)
+//   - content, reasoningContent: Message content and reasoning (if any)
+//   - model: LLM model name
+//   - userId: User ID for ownership
+//   - baseURL: API base URL for summarization
+//   - is_summarize_mode: Whether to enable automatic summarization
+//
+// Returns created message or error.
+func (s *ChatService) CreateChatMessageSimple(ctx context.Context, sessionUuid, uuid, role, content, reasoningContent, model string, userId int32, baseURL string, is_summarize_mode bool) (ChatMessage, error) {
+	numTokens, err := provider.GetTokenCount(content)
+	if err != nil {
+		slog.Warn("Failed to get token count", "error", err)
+		numTokens = len(content) / tokenEstimateRatio // Fallback estimate
+	}
+
+	summary := ""
+
+	if is_summarize_mode && numTokens > summarizeThreshold {
+		slog.Info("summarizing")
+		summary = provider.SummarizeWithTimeout(ctx, s.openAIKey, baseURL, content)
+		slog.Info("summarizing: " + summary)
+	}
+
+	// Extract artifacts from content
+	artifacts := extractArtifacts(content, s.newID)
+	artifactsJSON, err := json.Marshal(artifacts)
+	if err != nil {
+		slog.Warn("Failed to marshal artifacts", "error", err)
+		artifactsJSON = json.RawMessage([]byte("[]"))
+	}
+
+	chatMessage := sqlc_queries.CreateChatMessageParams{
+		ChatSessionUuid:    sessionUuid,
+		Uuid:               uuid,
+		Role:               role,
+		Content:            content,
+		ReasoningContent:   reasoningContent,
+		Model:              model,
+		UserID:             userId,
+		CreatedBy:          userId,
+		UpdatedBy:          userId,
+		LlmSummary:         summary,
+		TokenCount:         int32(numTokens),
+		Raw:                json.RawMessage([]byte("{}")),
+		Artifacts:          artifactsJSON,
+		SuggestedQuestions: json.RawMessage([]byte("[]")),
+	}
+	message, err := s.q.CreateChatMessage(ctx, chatMessage)
+	if err != nil {
+		return ChatMessage{}, eris.Wrap(err, "failed to create message ")
+	}
+	return chatMessageFromRecord(message), nil
+}
+
+// CompleteChatRequestWithSuggestedQuestions atomically saves the assistant
+// message and marks its originating request completed.
+func (s *ChatService) CompleteChatRequestWithSuggestedQuestions(ctx context.Context, requestUuid, sessionUuid, uuid, content, reasoningContent, model string, userId int32, baseURL string, is_summarize_mode, exploreMode bool, messages []models.Message) (ChatMessage, error) {
+	numTokens, err := provider.GetTokenCount(content)
+	if err != nil {
+		slog.Warn("Failed to get token count", "error", err)
+		numTokens = len(content) / tokenEstimateRatio // Fallback estimate
+	}
+
+	summary := ""
+	if is_summarize_mode && numTokens > summarizeThreshold {
+		slog.Info("summarizing")
+		summary = provider.SummarizeWithTimeout(ctx, s.openAIKey, baseURL, content)
+		slog.Info("summarizing: " + summary)
+	}
+
+	// Extract artifacts from content
+	artifacts := extractArtifacts(content, s.newID)
+	artifactsJSON, err := json.Marshal(artifacts)
+	if err != nil {
+		slog.Warn("Failed to marshal artifacts", "error", err)
+		artifactsJSON = json.RawMessage([]byte("[]"))
+	}
+
+	// Generate suggested questions if explore mode is enabled and role is assistant
+	suggestedQuestions := json.RawMessage([]byte("[]"))
+	if exploreMode && messages != nil {
+		questions := s.suggestions.GenerateSuggestions(ctx, content, messages)
+		if questionsJSON, err := json.Marshal(questions); err == nil {
+			suggestedQuestions = questionsJSON
+		} else {
+			slog.Warn("Failed to marshal suggested questions", "error", err)
+		}
+	}
+
+	params := sqlc_queries.CompleteChatRequestWithMessageParams{
+		ChatSessionUuid:    sessionUuid,
+		MessageUuid:        uuid,
+		Content:            content,
+		ReasoningContent:   reasoningContent,
+		Model:              model,
+		UserID:             userId,
+		CreatedBy:          userId,
+		UpdatedBy:          userId,
+		LlmSummary:         summary,
+		TokenCount:         int32(numTokens),
+		Raw:                json.RawMessage([]byte("{}")),
+		Artifacts:          artifactsJSON,
+		SuggestedQuestions: suggestedQuestions,
+		RequestUuid:        requestUuid,
+	}
+	message, err := s.q.CompleteChatRequestWithMessage(ctx, params)
+	if err != nil {
+		return ChatMessage{}, eris.Wrap(err, "failed to complete chat request ")
+	}
+	return chatMessageFromRecord(sqlc_queries.ChatMessage(message)), nil
+}
+
+// UpdateChatMessageContent updates the content of an existing chat message.
+// Recalculates token count for the updated content.
+func (s *ChatService) UpdateChatMessageContent(ctx context.Context, uuid string, userID int32, content string) error {
+	// encode
+	// num_tokens
+	num_tokens, err := provider.GetTokenCount(content)
+	if err != nil {
+		slog.Warn("Failed to get token count for update", "error", err)
+		num_tokens = len(content) / tokenEstimateRatio // Fallback estimate
+	}
+
+	rows, err := s.q.UpdateChatMessageContent(ctx, sqlc_queries.UpdateChatMessageContentParams{
+		Uuid:       uuid,
+		Content:    content,
+		TokenCount: int32(num_tokens),
+		UserID:     userID,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return domain.NotFound("Chat message", sql.ErrNoRows)
+	}
+	return nil
+}
+
+// UpdateChatMessageSuggestions updates the suggested questions for a chat message
+func (s *ChatService) UpdateChatMessageSuggestions(ctx context.Context, uuid string, userID int32, suggestedQuestions json.RawMessage) error {
+	_, err := s.q.UpdateChatMessageSuggestions(ctx, sqlc_queries.UpdateChatMessageSuggestionsParams{
+		Uuid:               uuid,
+		SuggestedQuestions: suggestedQuestions,
+		UserID:             userID,
+	})
+	return err
+}

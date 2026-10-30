@@ -1,0 +1,125 @@
+import { type Ref, ref } from 'vue'
+import { useDialog, useMessage } from 'naive-ui'
+import { createChatBot, createChatSnapshot } from '@/api/generated_client'
+import { useAppStore, useMessageStore, useSessionStore } from '@/store'
+import { useBasicLayout } from '@/hooks/useBasicLayout'
+import { t } from '@/locales'
+
+export function useChatActions(sessionUuidRef: Ref<string>) {
+  const dialog = useDialog()
+  const nui_msg = useMessage()
+  const sessionStore = useSessionStore()
+  const messageStore = useMessageStore()
+  const appStore = useAppStore()
+  const { isMobile } = useBasicLayout()
+
+  const snapshotLoading = ref<boolean>(false)
+  const botLoading = ref<boolean>(false)
+  const showUploadModal = ref<boolean>(false)
+  const showModal = ref<boolean>(false)
+  const showArtifactGallery = ref<boolean>(false)
+
+  async function handleAdd(dataSources: any[]) {
+    if (dataSources.length > 0) {
+      const new_chat_text = t('chat.new')
+      try {
+        await sessionStore.createNewSession(new_chat_text)
+        if (isMobile.value)
+          appStore.setSiderCollapsed(true)
+      }
+      catch (error) {
+        console.error('Failed to create new session:', error)
+      }
+    }
+    else {
+      nui_msg.warning(t('chat.alreadyInNewChat'))
+    }
+  }
+
+  async function handleSnapshot() {
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid) {
+      nui_msg.error('No active session selected.')
+      return
+    }
+
+    snapshotLoading.value = true
+    try {
+      const snapshot = await createChatSnapshot({ path: { uuid: sessionUuid } })
+      const snapshot_uuid = snapshot.uuid
+      window.open(`#/snapshot/${snapshot_uuid}`, '_blank')
+      nui_msg.success(t('chat.snapshotSuccess'))
+    }
+    catch (error) {
+      nui_msg.error(t('chat.snapshotFailed'))
+    }
+    finally {
+      snapshotLoading.value = false
+    }
+  }
+
+  async function handleCreateBot() {
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid) {
+      nui_msg.error('No active session selected.')
+      return
+    }
+
+    botLoading.value = true
+    try {
+      const snapshot = await createChatBot({ path: { uuid: sessionUuid } })
+      const snapshot_uuid = snapshot.uuid
+      window.open(`#/snapshot/${snapshot_uuid}`, '_blank')
+      nui_msg.success(t('chat.botSuccess'))
+    }
+    catch (error) {
+      nui_msg.error(t('chat.botFailed'))
+    }
+    finally {
+      botLoading.value = false
+    }
+  }
+
+  function handleClear(loading: any) {
+    if (loading.value)
+      return
+
+    const sessionUuid = sessionUuidRef.value
+    if (!sessionUuid) {
+      nui_msg.error('No active session selected.')
+      return
+    }
+
+    dialog.warning({
+      title: t('chat.clearChat'),
+      content: t('chat.clearChatConfirm'),
+      positiveText: t('common.yes'),
+      negativeText: t('common.no'),
+      onPositiveClick: async () => {
+        try {
+          await messageStore.clearSessionMessages(sessionUuid)
+        }
+        catch (error) {
+          nui_msg.error(t('common.wrong'))
+        }
+      },
+    })
+  }
+
+  const toggleArtifactGallery = (): void => {
+    showArtifactGallery.value = !showArtifactGallery.value
+  }
+
+  return {
+    snapshotLoading,
+    botLoading,
+    showUploadModal,
+    showModal,
+    showArtifactGallery,
+    handleAdd,
+    handleSnapshot,
+    handleCreateBot,
+    handleClear,
+    toggleArtifactGallery,
+  }
+}

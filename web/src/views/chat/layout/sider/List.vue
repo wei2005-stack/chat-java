@@ -1,0 +1,162 @@
+<script setup lang='ts'>
+import { computed, onMounted } from 'vue'
+import { NInput, NPopconfirm, NScrollbar, NTooltip, useMessage } from 'naive-ui'
+import { debounce } from 'lodash'
+import { SvgIcon } from '@/components/common'
+import { useAppStore, useAuthStore, useSessionStore, useWorkspaceStore } from '@/store'
+import { useBasicLayout } from '@/hooks/useBasicLayout'
+import ModelAvatar from '@/views/components/Avatar/ModelAvatar.vue'
+import { t } from '@/locales'
+
+const { isMobile } = useBasicLayout()
+const nui_msg = useMessage()
+
+const appStore = useAppStore()
+const sessionStore = useSessionStore()
+const workspaceStore = useWorkspaceStore()
+const authStore = useAuthStore()
+
+const dataSources = computed(() => {
+  // If no active workspace, show sessions from all workspaces
+  if (!workspaceStore.activeWorkspace)
+    return sessionStore.getAllSessions()
+
+  // Filter sessions by active workspace - show only sessions belonging to this workspace
+  const workspaceSessions = sessionStore.getSessionsByWorkspace(workspaceStore.activeWorkspace.uuid)
+  return workspaceSessions
+})
+const isLogined = computed(() => Boolean(authStore.token))
+
+onMounted(async () => {
+  if (isLogined.value)
+    await handleSyncChat()
+})
+async function handleSyncChat() {
+  try {
+    await sessionStore.syncAllWorkspaceSessions()
+  }
+  catch (error: any) {
+    if (error.response?.status === 500)
+      nui_msg.error(t('error.syncChatSession'))
+  }
+}
+
+async function handleSelect(uuid: string) {
+  if (isActive(uuid))
+    return
+
+  // Prevent multiple rapid session switches
+  if (sessionStore.isSwitchingSession)
+    return
+
+  try {
+    const session = sessionStore.getChatSessionByUuid(uuid)
+    if (session && session.workspaceUuid)
+      await sessionStore.setActiveSession(session.workspaceUuid, uuid)
+
+    if (isMobile.value)
+      appStore.setSiderCollapsed(true)
+  }
+  catch (error) {
+    console.error('Error handling session select:', error)
+  }
+}
+
+// Use debounce to prevent rapid session switching
+// Debounce waits for user to stop clicking before executing
+const debouncedHandleSelect = debounce((uuid: string) => {
+  handleSelect(uuid)
+}, 200, {
+  leading: true, // Execute immediately on first call
+  trailing: false, // Don't execute again after delay
+})
+
+function handleEdit({ uuid }: Chat.Session, isEdit: boolean, event?: MouseEvent) {
+  event?.stopPropagation()
+  sessionStore.updateSession(uuid, { isEdit })
+}
+function handleSave({ uuid, title }: Chat.Session, isEdit: boolean, event?: MouseEvent) {
+  event?.stopPropagation()
+  sessionStore.updateSession(uuid, { isEdit, title })
+}
+
+function handleDelete(index: number, event?: MouseEvent | TouchEvent) {
+  event?.stopPropagation()
+  const session = dataSources.value[index]
+  if (session)
+    sessionStore.deleteSession(session.uuid)
+}
+
+function handleEnter({ uuid, title }: Chat.Session, isEdit: boolean, event: KeyboardEvent) {
+  event?.stopPropagation()
+  if (event.key === 'Enter')
+    sessionStore.updateSession(uuid, { isEdit, title })
+}
+
+function isActive(uuid: string) {
+  return sessionStore.activeSessionUuid === uuid
+}
+</script>
+
+<template>
+  <NScrollbar class="px-2">
+    <div class="flex flex-col gap-2 text-sm">
+      <template v-if="!dataSources.length">
+        <div class="flex flex-col items-center mt-4 text-center text-neutral-300">
+          <SvgIcon icon="ri:inbox-line" class="mb-2 text-3xl" />
+          <span>{{ $t('common.noData') }}</span>
+        </div>
+      </template>
+      <template v-else>
+        <div v-for="(item, index) of dataSources" :key="index">
+          <a
+            class="relative flex items-center gap-2 px-3 py-2 break-all border rounded-sm cursor-pointer hover:bg-neutral-100 group dark:border-neutral-800 dark:hover:bg-[#24272e]"
+            :class="isActive(item.uuid) && ['border-[#4b9e5f]', 'bg-neutral-100', 'text-[#4b9e5f]', 'dark:bg-[#24272e]', 'dark:border-[#4b9e5f]', 'pr-14']"
+            @click="debouncedHandleSelect(item.uuid)"
+          >
+            <span>
+              <ModelAvatar :model="item.model" />
+            </span>
+            <div class="relative flex-1 overflow-hidden break-all text-ellipsis whitespace-nowrap">
+              <NInput
+                v-if="item.isEdit" v-model:value="item.title" data-testid="edit_session_topic_input" size="tiny"
+                @keypress="handleEnter(item, false, $event)"
+              />
+              <NTooltip v-else placement="top" :style="{ maxWidth: '400px' }">
+                <template #trigger>
+                  <span>{{ item.title }}</span>
+                </template>
+                {{ item.title }}
+              </NTooltip>
+            </div>
+            <div v-if="isActive(item.uuid)" class="absolute z-10 flex visible right-1">
+              <template v-if="item.isEdit">
+                <button class="p-1" data-testid="save_session_topic" @click="handleSave(item, false, $event)">
+                  <SvgIcon icon="ri:save-line" />
+                </button>
+              </template>
+              <template v-else>
+                <button class="p-1" data-testid="edit_session_topic">
+                  <SvgIcon icon="ri:edit-line" @click="handleEdit(item, true, $event)" />
+                </button>
+                <div v-if="dataSources.length > 1">
+                  <NPopconfirm
+                    placement="bottom" data-testid="confirm_delete_session"
+                    @positive-click="handleDelete(index, $event)"
+                  >
+                    <template #trigger>
+                      <button class="p-1">
+                        <SvgIcon icon="ri:delete-bin-line" />
+                      </button>
+                    </template>
+                    {{ $t('chat.deleteChatSessionsConfirm') }}
+                  </NPopconfirm>
+                </div>
+              </template>
+            </div>
+          </a>
+        </div>
+      </template>
+    </div>
+  </NScrollbar>
+</template>

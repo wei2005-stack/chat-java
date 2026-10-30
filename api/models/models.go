@@ -1,0 +1,47 @@
+package models
+
+import (
+	"log/slog"
+
+	"github.com/pkoukk/tiktoken-go"
+)
+
+func getTokenCount(content string) (int, error) {
+	encoding := "cl100k_base"
+	tke, err := tiktoken.GetEncoding(encoding)
+	if err != nil {
+		return 0, err
+	}
+	token := tke.Encode(content, nil, nil)
+	num_tokens := len(token)
+	return num_tokens, nil
+}
+
+type Message struct {
+	Role       string `json:"role"`
+	Content    string `json:"content"`
+	tokenCount int32
+}
+
+func (m Message) TokenCount() int32 {
+	if m.tokenCount != 0 {
+		return m.tokenCount
+	} else {
+		tokenCount, err := getTokenCount(m.Content)
+		if err != nil {
+			slog.Info("token count failed", "error", err)
+		}
+		return int32(tokenCount) + 1
+	}
+}
+
+func (m *Message) SetTokenCount(tokenCount int32) *Message {
+	m.tokenCount = tokenCount
+	return m
+}
+
+type LLMAnswer struct {
+	AnswerId         string `json:"id"`
+	Answer           string `json:"answer"`
+	ReasoningContent string `json:"reason_content"`
+}

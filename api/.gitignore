@@ -1,0 +1,4 @@
+tmp/
+chat_backend
+env.sh
+static/statictest_build

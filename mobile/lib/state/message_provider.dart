@@ -1,0 +1,661 @@
+import 'package:hooks_riverpod/hooks_riverpod.dart';
+
+import '../api/chat_api.dart';
+import '../api/answer_stream_event.dart';
+import '../constants/chat.dart';
+import '../models/chat_message.dart';
+import 'auth_provider.dart';
+import '../utils/api_error.dart';
+
+class MessageState {
+  const MessageState({
+    required this.messages,
+    required this.isLoading,
+    required this.sendingSessionIds,
+    this.errorMessage,
+  });
+
+  final List<ChatMessage> messages;
+  final bool isLoading;
+  final Set<String> sendingSessionIds;
+  final String? errorMessage;
+
+  MessageState copyWith({
+    List<ChatMessage>? messages,
+    bool? isLoading,
+    Set<String>? sendingSessionIds,
+    String? errorMessage,
+  }) {
+    return MessageState(
+      messages: messages ?? this.messages,
+      isLoading: isLoading ?? this.isLoading,
+      sendingSessionIds: sendingSessionIds ?? this.sendingSessionIds,
+      errorMessage: errorMessage,
+    );
+  }
+}
+
+class MessageNotifier extends StateNotifier<MessageState> {
+  MessageNotifier(this._ref, this._authNotifier)
+      : super(const MessageState(
+          messages: [],
+          isLoading: false,
+          sendingSessionIds: {},
+        ));
+
+  final Ref _ref;
+  final AuthNotifier _authNotifier;
+  ChatApi get _api => _ref.read(authedApiProvider);
+
+  Future<bool> _ensureAuth() async {
+    final ok = await _authNotifier.ensureFreshToken();
+    if (!ok) {
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: 'Please log in first.',
+      );
+    }
+    return ok;
+  }
+
+  Future<void> loadMessages(String sessionId) async {
+    state = state.copyWith(isLoading: true, errorMessage: null);
+    if (!await _ensureAuth()) {
+      return;
+    }
+    try {
+      var messages = await _api.fetchMessages(sessionId: sessionId);
+      if (messages.isEmpty) {
+        try {
+          final promptId = DateTime.now().microsecondsSinceEpoch.toString();
+          final prompt = await _api.createChatPrompt(
+            sessionId: sessionId,
+            promptId: promptId,
+            content: defaultSystemPromptForLocale(),
+          );
+          messages = [prompt];
+        } catch (error) {
+          // Keep loading messages even if the prompt creation fails.
+        }
+      }
+      final remaining = state.messages
+          .where((message) => message.sessionId != sessionId)
+          .toList();
+      final merged = _mergeSessionMessages(
+        existing: state.messages,
+        fetched: messages,
+        sessionId: sessionId,
+      );
+      state = state.copyWith(
+        messages: [...remaining, ...merged],
+        isLoading: false,
+      );
+    } catch (error) {
+      final errorMessage = formatApiError(error);
+      state = state.copyWith(
+        isLoading: false,
+        errorMessage: errorMessage,
+      );
+    }
+  }
+
+  Future<String?> sendMessage({
+    required String sessionId,
+    required String content,
+    required bool exploreMode,
+  }) async {
+    if (state.sendingSessionIds.contains(sessionId)) {
+      return 'Please wait for the current response to finish.';
+    }
+    final now = DateTime.now();
+    final chatUuid = now.microsecondsSinceEpoch.toString();
+    final userMessage = ChatMessage(
+      id: chatUuid,
+      sessionId: sessionId,
+      role: MessageRole.user,
+      content: content,
+      createdAt: now,
+    );
+    final assistantMessage = ChatMessage(
+      id: 'assistant-$chatUuid',
+      sessionId: sessionId,
+      role: MessageRole.assistant,
+      content: '',
+      createdAt: now,
+      loading: true,
+      suggestedQuestionsLoading: exploreMode,
+    );
+
+    final sendingSessions = {...state.sendingSessionIds, sessionId};
+    state = state.copyWith(
+      messages: [...state.messages, userMessage, assistantMessage],
+      sendingSessionIds: sendingSessions,
+      errorMessage: null,
+    );
+
+    try {
+      if (!await _ensureAuth()) {
+        _replaceMessageContent(
+          assistantMessage.id,
+          'Please log in first.',
+        );
+        _setLatestAssistantLoading(sessionId, false);
+        _clearSuggestedQuestionsLoading(sessionId);
+        final updatedSending = {...state.sendingSessionIds}..remove(sessionId);
+        state = state.copyWith(sendingSessionIds: updatedSending);
+        return 'Please log in first.';
+      }
+      await _api.streamChatResponse(
+        sessionId: sessionId,
+        chatUuid: chatUuid,
+        prompt: content,
+        onEvent: (event) {
+          _handleStreamEvent(sessionId, assistantMessage.id, event);
+        },
+        regenerate: false,
+      );
+      _setLatestAssistantLoading(sessionId, false);
+      _clearSuggestedQuestionsLoading(sessionId);
+      final updatedSending = {...state.sendingSessionIds}..remove(sessionId);
+      state = state.copyWith(sendingSessionIds: updatedSending);
+      return null;
+    } catch (error) {
+      final errorMessage = formatApiError(error);
+      _replaceMessageContent(
+        assistantMessage.id,
+        'Failed to get response. Please try again.',
+      );
+      _setLatestAssistantLoading(sessionId, false);
+      _clearSuggestedQuestionsLoading(sessionId);
+      final updatedSending = {...state.sendingSessionIds}..remove(sessionId);
+      state = state.copyWith(
+        sendingSessionIds: updatedSending,
+        errorMessage: errorMessage,
+      );
+      return errorMessage;
+    }
+  }
+
+  Future<String?> regenerateMessage({
+    required String messageId,
+  }) async {
+    final targetMessage =
+        state.messages.where((message) => message.id == messageId);
+    if (targetMessage.isEmpty) {
+      return 'Message not found.';
+    }
+
+    final message = targetMessage.first;
+    if (message.role != MessageRole.assistant) {
+      return 'Can only regenerate assistant messages.';
+    }
+
+    final sessionMessages = state.messages
+        .where((item) => item.sessionId == message.sessionId)
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    final sessionIndex =
+        sessionMessages.indexWhere((item) => item.id == messageId);
+    if (sessionIndex == -1) {
+      return 'Message not found.';
+    }
+
+    // Find the user message before this assistant message
+    final userMessageIndex = sessionIndex - 1;
+    if (userMessageIndex < 0) {
+      return 'No user message found to regenerate from.';
+    }
+
+    final userMessage = sessionMessages[userMessageIndex];
+    if (userMessage.role != MessageRole.user) {
+      return 'Previous message is not a user message.';
+    }
+
+    final sessionId = message.sessionId;
+    if (state.sendingSessionIds.contains(sessionId)) {
+      return 'Please wait for the current response to finish.';
+    }
+
+    // Create a new assistant message for the regeneration
+    final now = DateTime.now();
+    final newChatUuid = now.microsecondsSinceEpoch.toString();
+    final newAssistantMessage = ChatMessage(
+      id: 'assistant-$newChatUuid',
+      sessionId: sessionId,
+      role: MessageRole.assistant,
+      content: '',
+      createdAt: now,
+      loading: true,
+      suggestedQuestionsLoading: message.suggestedQuestionsLoading,
+    );
+
+    final globalIndex =
+        state.messages.indexWhere((item) => item.id == messageId);
+    if (globalIndex == -1) {
+      return 'Message not found.';
+    }
+
+    // Replace the target assistant message in the global message list.
+    final updatedMessages = [...state.messages];
+    updatedMessages[globalIndex] = newAssistantMessage;
+
+    final sendingSessions = {...state.sendingSessionIds, sessionId};
+    state = state.copyWith(
+      messages: updatedMessages,
+      sendingSessionIds: sendingSessions,
+      errorMessage: null,
+    );
+
+    try {
+      if (!await _ensureAuth()) {
+        _replaceMessageContent(
+          newAssistantMessage.id,
+          'Please log in first.',
+        );
+        _setLatestAssistantLoading(sessionId, false);
+        _clearSuggestedQuestionsLoading(sessionId);
+        final updatedSending = {...state.sendingSessionIds}..remove(sessionId);
+        state = state.copyWith(sendingSessionIds: updatedSending);
+        return 'Please log in first.';
+      }
+      await _api.streamChatResponse(
+        sessionId: sessionId,
+        chatUuid: newChatUuid,
+        prompt: userMessage.content,
+        onEvent: (event) {
+          _handleStreamEvent(sessionId, newAssistantMessage.id, event);
+        },
+        regenerate: true,
+      );
+      _setLatestAssistantLoading(sessionId, false);
+      _clearSuggestedQuestionsLoading(sessionId);
+      final updatedSending = {...state.sendingSessionIds}..remove(sessionId);
+      state = state.copyWith(sendingSessionIds: updatedSending);
+      return null;
+    } catch (error) {
+      final errorMessage = formatApiError(error);
+      _replaceMessageContent(
+        newAssistantMessage.id,
+        'Failed to regenerate response. Please try again.',
+      );
+      _setLatestAssistantLoading(sessionId, false);
+      _clearSuggestedQuestionsLoading(sessionId);
+      final updatedSending = {...state.sendingSessionIds}..remove(sessionId);
+      state = state.copyWith(
+        sendingSessionIds: updatedSending,
+        errorMessage: errorMessage,
+      );
+      return errorMessage;
+    }
+  }
+
+  void addMessage(ChatMessage message) {
+    state = state.copyWith(messages: [...state.messages, message]);
+  }
+
+  void reset() {
+    state = const MessageState(
+      messages: [],
+      isLoading: false,
+      sendingSessionIds: {},
+    );
+  }
+
+  void _handleStreamEvent(
+      String sessionId, String tempId, AnswerStreamEvent event) {
+    final answerId = event.answerId;
+    final messageIndex = state.messages.indexWhere(
+      (message) =>
+          message.id == tempId || (answerId != null && message.id == answerId),
+    );
+    if (messageIndex == -1) {
+      return;
+    }
+
+    final existing = state.messages[messageIndex];
+    final appendsDelta = event.type == AnswerStreamEventType.delta ||
+        event.type == AnswerStreamEventType.reasoningDelta;
+    final newContent =
+        existing.content + (appendsDelta ? event.delta ?? '' : '');
+    final newQuestions = event.type == AnswerStreamEventType.suggestedQuestions
+        ? event.suggestedQuestions
+        : null;
+    final questions = newQuestions ?? existing.suggestedQuestions;
+    final loading =
+        newQuestions != null ? false : existing.suggestedQuestionsLoading;
+    final batches = newQuestions != null
+        ? [newQuestions]
+        : existing.suggestedQuestionsBatches;
+    final currentBatch = newQuestions != null
+        ? batches.length - 1
+        : existing.currentSuggestedQuestionsBatch;
+    final updated = ChatMessage(
+      id: answerId ?? existing.id,
+      sessionId: existing.sessionId,
+      role: existing.role,
+      content: newContent,
+      createdAt: existing.createdAt,
+      loading: event.type != AnswerStreamEventType.completed,
+      suggestedQuestions: questions,
+      suggestedQuestionsLoading: loading,
+      suggestedQuestionsBatches: batches,
+      currentSuggestedQuestionsBatch: currentBatch,
+      suggestedQuestionsGenerating: existing.suggestedQuestionsGenerating,
+    );
+    final updatedMessages = [...state.messages];
+    updatedMessages[messageIndex] = updated;
+    state = state.copyWith(messages: updatedMessages);
+  }
+
+  void _replaceMessageContent(String messageId, String content) {
+    final index =
+        state.messages.indexWhere((message) => message.id == messageId);
+    if (index == -1) {
+      return;
+    }
+    final existing = state.messages[index];
+    final updated = ChatMessage(
+      id: existing.id,
+      sessionId: existing.sessionId,
+      role: existing.role,
+      content: content,
+      createdAt: existing.createdAt,
+      loading: false,
+      suggestedQuestions: existing.suggestedQuestions,
+      suggestedQuestionsLoading: existing.suggestedQuestionsLoading,
+      suggestedQuestionsBatches: existing.suggestedQuestionsBatches,
+      currentSuggestedQuestionsBatch: existing.currentSuggestedQuestionsBatch,
+      suggestedQuestionsGenerating: existing.suggestedQuestionsGenerating,
+    );
+    final updatedMessages = [...state.messages];
+    updatedMessages[index] = updated;
+    state = state.copyWith(messages: updatedMessages);
+  }
+
+  void _clearSuggestedQuestionsLoading(String sessionId) {
+    final index = state.messages.lastIndexWhere(
+      (message) =>
+          message.sessionId == sessionId &&
+          message.role == MessageRole.assistant &&
+          message.suggestedQuestionsLoading,
+    );
+    if (index == -1) {
+      return;
+    }
+    final existing = state.messages[index];
+    final updated = ChatMessage(
+      id: existing.id,
+      sessionId: existing.sessionId,
+      role: existing.role,
+      content: existing.content,
+      createdAt: existing.createdAt,
+      loading: existing.loading,
+      suggestedQuestions: existing.suggestedQuestions,
+      suggestedQuestionsLoading: false,
+      suggestedQuestionsBatches: existing.suggestedQuestionsBatches,
+      currentSuggestedQuestionsBatch: existing.currentSuggestedQuestionsBatch,
+      suggestedQuestionsGenerating: existing.suggestedQuestionsGenerating,
+    );
+    final updatedMessages = [...state.messages];
+    updatedMessages[index] = updated;
+    state = state.copyWith(messages: updatedMessages);
+  }
+
+  Future<String?> generateMoreSuggestions(String messageId) async {
+    final index =
+        state.messages.indexWhere((message) => message.id == messageId);
+    if (index == -1) {
+      return 'Message not found.';
+    }
+    final existing = state.messages[index];
+    if (existing.role != MessageRole.assistant) {
+      return 'Suggestions only apply to assistant messages.';
+    }
+    final updatedMessages = [...state.messages];
+    updatedMessages[index] = ChatMessage(
+      id: existing.id,
+      sessionId: existing.sessionId,
+      role: existing.role,
+      content: existing.content,
+      createdAt: existing.createdAt,
+      loading: existing.loading,
+      suggestedQuestions: existing.suggestedQuestions,
+      suggestedQuestionsLoading: existing.suggestedQuestionsLoading,
+      suggestedQuestionsBatches: existing.suggestedQuestionsBatches,
+      currentSuggestedQuestionsBatch: existing.currentSuggestedQuestionsBatch,
+      suggestedQuestionsGenerating: true,
+    );
+    state = state.copyWith(messages: updatedMessages);
+
+    try {
+      if (!await _ensureAuth()) {
+        updatedMessages[index] = ChatMessage(
+          id: existing.id,
+          sessionId: existing.sessionId,
+          role: existing.role,
+          content: existing.content,
+          createdAt: existing.createdAt,
+          loading: existing.loading,
+          suggestedQuestions: existing.suggestedQuestions,
+          suggestedQuestionsLoading: existing.suggestedQuestionsLoading,
+          suggestedQuestionsBatches: existing.suggestedQuestionsBatches,
+          currentSuggestedQuestionsBatch:
+              existing.currentSuggestedQuestionsBatch,
+          suggestedQuestionsGenerating: false,
+        );
+        const errorMessage = 'Please log in first.';
+        state = state.copyWith(
+            messages: updatedMessages, errorMessage: errorMessage);
+        return errorMessage;
+      }
+      final response = await _api.generateMoreSuggestions(messageId: messageId);
+      final newSuggestions = response.newSuggestions;
+      final batches = [
+        ...existing.suggestedQuestionsBatches,
+        newSuggestions,
+      ];
+      final updated = ChatMessage(
+        id: existing.id,
+        sessionId: existing.sessionId,
+        role: existing.role,
+        content: existing.content,
+        createdAt: existing.createdAt,
+        loading: existing.loading,
+        suggestedQuestions: newSuggestions,
+        suggestedQuestionsLoading: false,
+        suggestedQuestionsBatches: batches,
+        currentSuggestedQuestionsBatch: batches.length - 1,
+        suggestedQuestionsGenerating: false,
+      );
+      updatedMessages[index] = updated;
+      state = state.copyWith(messages: updatedMessages);
+      return null;
+    } catch (error) {
+      final errorMessage = formatApiError(error);
+      updatedMessages[index] = ChatMessage(
+        id: existing.id,
+        sessionId: existing.sessionId,
+        role: existing.role,
+        content: existing.content,
+        createdAt: existing.createdAt,
+        loading: existing.loading,
+        suggestedQuestions: existing.suggestedQuestions,
+        suggestedQuestionsLoading: existing.suggestedQuestionsLoading,
+        suggestedQuestionsBatches: existing.suggestedQuestionsBatches,
+        currentSuggestedQuestionsBatch: existing.currentSuggestedQuestionsBatch,
+        suggestedQuestionsGenerating: false,
+      );
+      state =
+          state.copyWith(messages: updatedMessages, errorMessage: errorMessage);
+      return errorMessage;
+    }
+  }
+
+  void setSuggestedQuestionBatch({
+    required String messageId,
+    required int batchIndex,
+  }) {
+    final index =
+        state.messages.indexWhere((message) => message.id == messageId);
+    if (index == -1) {
+      return;
+    }
+    final existing = state.messages[index];
+    if (batchIndex < 0 ||
+        batchIndex >= existing.suggestedQuestionsBatches.length) {
+      return;
+    }
+    final updated = ChatMessage(
+      id: existing.id,
+      sessionId: existing.sessionId,
+      role: existing.role,
+      content: existing.content,
+      createdAt: existing.createdAt,
+      loading: existing.loading,
+      suggestedQuestions: existing.suggestedQuestionsBatches[batchIndex],
+      suggestedQuestionsLoading: existing.suggestedQuestionsLoading,
+      suggestedQuestionsBatches: existing.suggestedQuestionsBatches,
+      currentSuggestedQuestionsBatch: batchIndex,
+      suggestedQuestionsGenerating: existing.suggestedQuestionsGenerating,
+    );
+    final updatedMessages = [...state.messages];
+    updatedMessages[index] = updated;
+    state = state.copyWith(messages: updatedMessages);
+  }
+
+  Future<String?> clearSessionMessages(String sessionId) async {
+    try {
+      if (!await _ensureAuth()) {
+        return 'Please log in first.';
+      }
+      await _api.clearSessionMessages(sessionId);
+      final fetched = await _api.fetchMessages(sessionId: sessionId);
+      final remaining = state.messages
+          .where((message) => message.sessionId != sessionId)
+          .toList();
+      state = state.copyWith(messages: [...remaining, ...fetched]);
+      return null;
+    } catch (error) {
+      final errorMessage = formatApiError(error);
+      state = state.copyWith(errorMessage: errorMessage);
+      return errorMessage;
+    }
+  }
+
+  Future<String?> deleteMessage(String messageId) async {
+    try {
+      if (!await _ensureAuth()) {
+        return 'Please log in first.';
+      }
+      final message = state.messages.firstWhere(
+        (message) => message.id == messageId,
+        orElse: () => ChatMessage(
+          id: messageId,
+          sessionId: '',
+          role: MessageRole.assistant,
+          content: '',
+          createdAt: DateTime.now(),
+        ),
+      );
+      if (message.role == MessageRole.system) {
+        await _api.deleteChatPrompt(messageId);
+      } else {
+        await _api.deleteMessage(messageId);
+      }
+      final updatedMessages =
+          state.messages.where((message) => message.id != messageId).toList();
+      state = state.copyWith(messages: updatedMessages);
+      return null;
+    } catch (error) {
+      final errorMessage = formatApiError(error);
+      state = state.copyWith(errorMessage: errorMessage);
+      return errorMessage;
+    }
+  }
+
+  Future<String?> toggleMessagePin(String messageId) async {
+    final index =
+        state.messages.indexWhere((message) => message.id == messageId);
+    if (index == -1) {
+      return 'Message not found.';
+    }
+
+    final message = state.messages[index];
+    final newPinStatus = !message.isPinned;
+
+    // Optimistically update UI
+    final updatedMessage = message.copyWith(isPinned: newPinStatus);
+    final updatedMessages = [...state.messages];
+    updatedMessages[index] = updatedMessage;
+    state = state.copyWith(messages: updatedMessages);
+
+    try {
+      if (!await _ensureAuth()) {
+        return 'Please log in first.';
+      }
+      await _api.updateMessage(
+        message: updatedMessage,
+        isPinned: newPinStatus,
+      );
+      return null;
+    } catch (error) {
+      // Revert on error
+      final revertedMessages = [...state.messages];
+      revertedMessages[index] = message;
+      final errorMessage = formatApiError(error);
+      state = state.copyWith(
+          messages: revertedMessages, errorMessage: errorMessage);
+      return errorMessage;
+    }
+  }
+
+  void _setLatestAssistantLoading(String sessionId, bool loading) {
+    final index = state.messages.lastIndexWhere(
+      (message) =>
+          message.sessionId == sessionId &&
+          message.role == MessageRole.assistant,
+    );
+    if (index == -1) {
+      return;
+    }
+    final existing = state.messages[index];
+    if (existing.loading == loading) {
+      return;
+    }
+    final updated = existing.copyWith(loading: loading);
+    final updatedMessages = [...state.messages];
+    updatedMessages[index] = updated;
+    state = state.copyWith(messages: updatedMessages);
+  }
+}
+
+final messageProvider = StateNotifierProvider<MessageNotifier, MessageState>(
+  (ref) => MessageNotifier(
+    ref,
+    ref.read(authProvider.notifier),
+  ),
+);
+
+final messagesForSessionProvider =
+    Provider.family<List<ChatMessage>, String>((ref, sessionId) {
+  final messages = ref.watch(messageProvider).messages;
+  return messages.where((message) => message.sessionId == sessionId).toList()
+    ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+});
+
+List<ChatMessage> _mergeSessionMessages({
+  required List<ChatMessage> existing,
+  required List<ChatMessage> fetched,
+  required String sessionId,
+}) {
+  final fetchedMap = <String, ChatMessage>{
+    for (final message in fetched) message.id: message,
+  };
+  final extras = existing.where(
+    (message) =>
+        message.sessionId == sessionId && !fetchedMap.containsKey(message.id),
+  );
+  final merged = [...fetched, ...extras];
+  merged.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+  return merged;
+}

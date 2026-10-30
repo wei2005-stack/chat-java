@@ -1,0 +1,238 @@
+package provider
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"time"
+
+	openai "github.com/sashabaranov/go-openai"
+	"github.com/swuecho/chat_backend/domain"
+	"github.com/swuecho/chat_backend/dto"
+	llm_openai "github.com/swuecho/chat_backend/llm/openai"
+	"github.com/swuecho/chat_backend/models"
+)
+
+// OpenAI ChatModel implementation
+type OpenAIChatModel struct {
+	h Handler
+}
+
+// NewOpenAIChatModel creates a new OpenAIChatModel.
+func NewOpenAIChatModel(h Handler) *OpenAIChatModel {
+	return &OpenAIChatModel{h: h}
+}
+
+func (m *OpenAIChatModel) Stream(ctx context.Context, input Request) (<-chan StreamChunk, error) {
+	chatSession, chatCompletionMessages := input.Session, input.Messages
+	chatUuid, regenerate, streamOutput := input.ChatUUID, input.Regenerate, input.Stream
+	if limiter := m.h.Config().RateLimiter; limiter != nil {
+		if err := limiter.Wait(ctx); err != nil {
+			return nil, normalizeFailure("openai", "wait for local rate limit", err)
+		}
+	}
+
+	if err := m.h.CheckModelAccess(ctx, chatSession.UUID, chatSession.Model, chatSession.UserID); err != nil {
+		return nil, err
+	}
+
+	chatModel := input.Model
+
+	config, err := GenOpenAIConfig(chatModel, m.h.Config())
+	if err != nil {
+		return nil, classifiedFailure("openai", "configure", domain.ProviderFailureConfiguration, false, err)
+	}
+
+	openaiReq := NewChatCompletionRequest(chatSession, chatCompletionMessages, input.Files, streamOutput)
+	openaiReq.Model = NormalizeOpenAIModelName(chatModel, openaiReq.Model)
+	if len(openaiReq.Messages) <= 1 {
+		return nil, dto.ErrSystemMessageError
+	}
+	slog.Info("OpenAI request prepared", "model", openaiReq.Model, "messageCount", len(openaiReq.Messages), "temperature", openaiReq.Temperature)
+	client := openai.NewClientWithConfig(config)
+
+	ch := make(chan StreamChunk, 10)
+	go func() {
+		defer close(ch)
+		if streamOutput {
+			doChatStream(ctx, ch, client, openaiReq, chatSession.N, chatUuid, regenerate, input.NewID, chatModel.URL, config.BaseURL)
+		} else {
+			handleRegularResponse(ctx, ch, client, openaiReq, chatModel.URL, config.BaseURL)
+		}
+	}()
+	return ch, nil
+}
+
+func handleRegularResponse(ctx context.Context, ch chan<- StreamChunk, client *openai.Client, req openai.ChatCompletionRequest, configuredURL string, baseURL string) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	completion, err := client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		slog.Info("OpenAI request failed", "model", req.Model, "configuredURL", configuredURL, "baseURL", baseURL, "error", err)
+		emitChunk(ctx, ch, StreamChunk{Err: normalizeFailure("openai", "complete", err)})
+		return
+	}
+
+	emitChunk(ctx, ch, StreamChunk{
+		ID:      completion.ID,
+		Content: completion.Choices[0].Message.Content,
+		Done:    true,
+		FinalAnswer: &models.LLMAnswer{
+			Answer:   completion.Choices[0].Message.Content,
+			AnswerId: completion.ID,
+		},
+	})
+}
+
+// doChatStream handles streaming chat completion responses from OpenAI.
+// It sends chunks on the provided channel and closes it when done.
+func doChatStream(ctx context.Context, ch chan<- StreamChunk, client *openai.Client, req openai.ChatCompletionRequest, bufferLen int32, chatUuid string, regenerate bool, newID func() string, configuredURL string, baseURL string) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	slog.Info("Creating OpenAI stream")
+	stream, err := client.CreateChatCompletionStream(ctx, req)
+	if err != nil {
+		slog.Info("OpenAI stream setup failed", "model", req.Model, "configuredURL", configuredURL, "baseURL", baseURL, "error", err)
+		emitChunk(ctx, ch, StreamChunk{Err: normalizeFailure("openai", "open stream", err)})
+		return
+	}
+	defer func() {
+		if err := stream.Close(); err != nil {
+			slog.Error("error closing OpenAI stream", "error", err)
+		}
+	}()
+
+	var answerID string
+	var hasReason bool
+	var reasonTagOpened bool
+	var reasonTagClosed bool
+
+	if bufferLen == 0 {
+		slog.Info("Buffer length is 0, setting to 1")
+		bufferLen = 1
+	}
+
+	TextBuffer := NewTextBuffer(bufferLen, "", "")
+	reasonBuffer := NewTextBuffer(bufferLen, "<think>\n\n", "\n\n</think>\n\n")
+	answerID = generateAnswerID(chatUuid, regenerate, newID)
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Stream cancelled by client", "error", ctx.Err())
+			llmAnswer := models.LLMAnswer{Answer: TextBuffer.String("\n"), AnswerId: answerID}
+			if hasReason {
+				llmAnswer.ReasoningContent = reasonBuffer.String("\n")
+			}
+			return
+		default:
+		}
+
+		rawLine, err := stream.RecvRaw()
+		if err != nil {
+			slog.Info("OpenAI stream receive error", "model", req.Model, "configuredURL", configuredURL, "baseURL", baseURL, "error", err)
+			if errors.Is(err, io.EOF) {
+				if TextBuffer.String("\n") == "" && reasonBuffer.String("\n") == "" {
+					errMsg := fmt.Sprintf("stream closed without content; verify configured URL %q resolves to a valid OpenAI-compatible base URL %q and that model %q is valid", configuredURL, baseURL, req.Model)
+					slog.Info(errMsg)
+					emitChunk(ctx, ch, StreamChunk{Err: classifiedFailure("openai", "read stream", domain.ProviderFailureInvalidResponse, false, errors.New(errMsg))})
+					return
+				}
+				llmAnswer := models.LLMAnswer{Answer: TextBuffer.String("\n"), AnswerId: answerID}
+				if hasReason {
+					llmAnswer.ReasoningContent = reasonBuffer.String("\n")
+				}
+				emitChunk(ctx, ch, StreamChunk{Done: true, FinalAnswer: &llmAnswer})
+				return
+			}
+			slog.Info("Stream error", "error", err)
+			emitChunk(ctx, ch, StreamChunk{Err: normalizeFailure("openai", "read stream", err)})
+			return
+		}
+
+		response := llm_openai.ChatCompletionStreamResponse{}
+		if err := json.Unmarshal(rawLine, &response); err != nil {
+			slog.Info("Could not unmarshal response", "error", err)
+			continue
+		}
+
+		textIdx := response.Choices[0].Index
+		delta := response.Choices[0].Delta
+
+		TextBuffer.AppendByIndex(textIdx, delta.Content)
+		if len(delta.ReasoningContent) > 0 {
+			hasReason = true
+			reasonBuffer.AppendByIndex(textIdx, delta.ReasoningContent)
+		}
+
+		if answerID == "" {
+			answerID = strings.TrimPrefix(response.ID, "chatcmpl-")
+		}
+
+		if len(delta.Content) > 0 || len(delta.ReasoningContent) > 0 {
+			deltaToSend := processDelta(delta, &reasonTagOpened, &reasonTagClosed, hasReason)
+			if len(deltaToSend) > 0 {
+				if !emitChunk(ctx, ch, StreamChunk{ID: answerID, Content: deltaToSend}) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// processDelta handles the logic for processing delta content with thinking tags
+func processDelta(delta llm_openai.ChatCompletionStreamChoiceDelta, reasonTagOpened *bool, reasonTagClosed *bool, hasReason bool) string {
+	var deltaToSend string
+
+	if len(delta.ReasoningContent) > 0 {
+		if !*reasonTagOpened {
+			deltaToSend = "<think>" + delta.ReasoningContent
+			*reasonTagOpened = true
+		} else {
+			deltaToSend = delta.ReasoningContent
+		}
+	} else if hasReason && !*reasonTagClosed {
+		deltaToSend = "</think>" + delta.Content
+		*reasonTagClosed = true
+	} else {
+		deltaToSend = delta.Content
+	}
+
+	return deltaToSend
+}
+
+// NewUserMessage creates a new OpenAI user message
+func NewUserMessage(content string) openai.ChatCompletionMessage {
+	return openai.ChatCompletionMessage{Role: "user", Content: content}
+}
+
+// NewChatCompletionRequest creates an OpenAI chat completion request from session and messages
+func NewChatCompletionRequest(chatSession Session, chatCompletionMessages []models.Message, chatFiles []File, streamOutput bool) openai.ChatCompletionRequest {
+	openaiMessages := messagesToOpenAIMesages(chatCompletionMessages, chatFiles)
+
+	for _, m := range openaiMessages {
+		b, _ := m.MarshalJSON()
+		slog.Info("openai message", "msg", string(b))
+	}
+
+	slog.Info("openai messages", "messages", openaiMessages)
+	topP := float32(chatSession.TopP) - 0.01
+	if topP <= 0 {
+		topP = 0.01
+	}
+	openaiReq := openai.ChatCompletionRequest{
+		Model:       chatSession.Model,
+		Messages:    openaiMessages,
+		Temperature: float32(chatSession.Temperature),
+		TopP:        topP,
+		N:           int(chatSession.N),
+		Stream:      streamOutput,
+	}
+	return openaiReq
+}

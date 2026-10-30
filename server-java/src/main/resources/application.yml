@@ -1,0 +1,31 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://127.0.0.1:5432/chat}
+    username: ${PG_USER:postgres}
+    password: ${PG_PASSWORD:postgres}
+    hikari:
+      maximum-pool-size: 10
+  jackson:
+    default-property-inclusion: non_null
+  mvc:
+    async:
+      request-timeout: 300000
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:chat-java-dev-secret-please-change-in-production-0123456789}
+    audience: ${JWT_AUDIENCE:chat}
+    access-token-minutes: 30
+    refresh-token-days: 7
+  chat:
+    # Same default as the Go implementation.
+    default-system-prompt: "You are a helpful, concise assistant. Ask clarifying questions when needed. Provide accurate answers with short reasoning and actionable steps. If unsure, say so and suggest how to verify."
+    max-history-messages: 10
+    request-timeout-seconds: 120
+
+logging:
+  level:
+    com.chat: info

@@ -1,0 +1,153 @@
+package provider
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/swuecho/chat_backend/domain"
+	"github.com/swuecho/chat_backend/models"
+)
+
+// OllamaResponse represents the response structure from Ollama API
+type OllamaResponse struct {
+	Model              string         `json:"model"`
+	CreatedAt          time.Time      `json:"created_at"`
+	Done               bool           `json:"done"`
+	Message            models.Message `json:"message"`
+	TotalDuration      int64          `json:"total_duration"`
+	LoadDuration       int64          `json:"load_duration"`
+	PromptEvalCount    int            `json:"prompt_eval_count"`
+	PromptEvalDuration int64          `json:"prompt_eval_duration"`
+	EvalCount          int            `json:"eval_count"`
+	EvalDuration       int64          `json:"eval_duration"`
+}
+
+// Ollama ChatModel implementation
+type OllamaChatModel struct {
+	h Handler
+}
+
+// NewOllamaChatModel creates a new OllamaChatModel.
+func NewOllamaChatModel(h Handler) *OllamaChatModel {
+	return &OllamaChatModel{h: h}
+}
+
+func (m *OllamaChatModel) Stream(ctx context.Context, input Request) (<-chan StreamChunk, error) {
+	ch := make(chan StreamChunk, 10)
+	go func() {
+		defer close(ch)
+		chatOllamStream(ctx, ch, input)
+	}()
+	return ch, nil
+}
+
+func chatOllamStream(ctx context.Context, ch chan<- StreamChunk, input Request) {
+	chatSession, chatCompletionMessages := input.Session, input.Messages
+	chatUuid, regenerate, chatModel := input.ChatUUID, input.Regenerate, input.Model
+
+	jsonData := map[string]any{
+		"model":    strings.Replace(chatSession.Model, "ollama-", "", 1),
+		"messages": chatCompletionMessages,
+	}
+	jsonValue, _ := json.Marshal(jsonData)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", chatModel.URL, bytes.NewBuffer(jsonValue))
+	if err != nil {
+		emitChunk(ctx, ch, StreamChunk{Err: classifiedFailure("ollama", "create request", domain.ProviderFailureConfiguration, false, err)})
+		return
+	}
+
+	apiKey := os.Getenv(chatModel.APIAuthKey)
+	authHeaderName := chatModel.APIAuthHeader
+	if authHeaderName != "" {
+		req.Header.Set(authHeaderName, apiKey)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Access-Control-Allow-Origin", "*")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		emitChunk(ctx, ch, StreamChunk{Err: normalizeFailure("ollama", "open stream", err)})
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		emitChunk(ctx, ch, StreamChunk{Err: domain.NewProviderHTTPFailure("ollama", "open stream", resp.StatusCode, fmt.Errorf("unexpected HTTP status %s", resp.Status))})
+		return
+	}
+
+	ioreader := bufio.NewReader(resp.Body)
+	defer resp.Body.Close()
+
+	var answer string
+	answerID := generateAnswerID(chatUuid, regenerate, input.NewID)
+
+	count := 0
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Ollama stream cancelled by client", "error", ctx.Err())
+			return
+		default:
+		}
+
+		count++
+		if count > 10000 {
+			break
+		}
+		line, err := ioreader.ReadBytes('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				fmt.Println("End of stream reached")
+				break
+			}
+			emitChunk(ctx, ch, StreamChunk{Err: normalizeFailure("ollama", "read stream", err)})
+			return
+		}
+		var streamResp OllamaResponse
+		if err := json.Unmarshal(line, &streamResp); err != nil {
+			emitChunk(ctx, ch, StreamChunk{Err: classifiedFailure("ollama", "decode stream", domain.ProviderFailureInvalidResponse, false, err)})
+			return
+		}
+		delta := strings.ReplaceAll(streamResp.Message.Content, "<0x0A>", "\n")
+		answer += delta
+
+		if streamResp.Done {
+			fmt.Println("DONE break")
+			break
+		}
+		if answerID == "" {
+			answerID = generateAnswerID("", false, input.NewID)
+		}
+
+		if len(delta) > 0 {
+			if !emitChunk(ctx, ch, StreamChunk{ID: answerID, Content: delta}) {
+				return
+			}
+		}
+	}
+
+	emitChunk(ctx, ch, StreamChunk{
+		ID:   answerID,
+		Done: true,
+		FinalAnswer: &models.LLMAnswer{
+			Answer:   answer,
+			AnswerId: answerID,
+		},
+	})
+}
